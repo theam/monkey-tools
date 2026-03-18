@@ -1,0 +1,27 @@
+{
+  "name": "monkey-tools",
+  "owner": {
+    "name": "The Agile Monkeys",
+    "email": "labs@theagilemonkeys.com"
+  },
+  "metadata": {
+    "description": "AI-powered tools for Claude by The Agile Monkeys",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "transcription",
+      "source": "transcription",
+      "description": "Local-first audio transcription with speaker diarization. Uses Apple Silicon GPU (MLX) for ~5x real-time speed. No API keys, no cloud — everything runs on your machine.",
+      "version": "0.1.0",
+      "author": {
+        "name": "The Agile Monkeys"
+      },
+      "homepage": "https://github.com/theam/monkey-tools",
+      "repository": "https://github.com/theam/monkey-tools",
+      "license": "Apache-2.0",
+      "keywords": ["transcription", "audio", "diarization", "whisper", "mlx", "apple-silicon"],
+      "category": "productivity"
+    }
+  ]
+}
