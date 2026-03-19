@@ -6,36 +6,19 @@ on first transcription and cached for subsequent uses.
 """
 
 import json
-import os
-import subprocess
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-# Plugin directory and bundled models
-_PLUGIN_DIR = Path(__file__).parent
-_MODELS_DIR = _PLUGIN_DIR / "models"
+from transcription import (
+    export_transcript,
+    find_audio_files,
+    format_transcript,
+    srt_time,
+    transcribe,
+)
 
-# Stable venv location for ML dependencies (survives plugin cache changes)
-_ML_VENV = Path.home() / ".local" / "share" / "transcription-mcp" / ".venv"
-
-# Lazy-loaded modules
-_torch = None
-_whisperx = None
-_mlx_whisper = None
-_DiarizationPipeline = None
-
-# Runtime state
-_ml_deps_ready = False
-_use_mlx = False
-_device = "cpu"
-_compute_type = "int8"
-_mlx_model = os.environ.get("MLX_MODEL", "mlx-community/whisper-large-v3-mlx")
-_model = None
-_diarize_pipeline = None
+# In-memory transcription store (session-scoped)
 _transcriptions: dict[str, dict] = {}
 
 mcp = FastMCP(
@@ -51,161 +34,6 @@ mcp = FastMCP(
 )
 
 
-def _ensure_ml_deps():
-    """Install and import ML dependencies on first use."""
-    global _ml_deps_ready, _torch, _whisperx, _mlx_whisper, _DiarizationPipeline
-    global _use_mlx, _device, _compute_type
-
-    if _ml_deps_ready:
-        return
-
-    # Check if deps are already importable
-    try:
-        import torch
-        import whisperx
-        _torch = torch
-        _whisperx = whisperx
-    except ImportError:
-        # Install ML deps into the stable venv
-        print("Installing ML dependencies (first run only, ~2GB download)...")
-        _ML_VENV.parent.mkdir(parents=True, exist_ok=True)
-        ml_deps = [
-            "torch>=2.8.0",
-            "torchaudio>=2.8.0",
-            "whisperx>=3.8.2",
-            "mlx-whisper>=0.4.0",
-        ]
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + ml_deps,
-        )
-        print("ML dependencies installed.")
-        import torch
-        import whisperx
-        _torch = torch
-        _whisperx = whisperx
-
-    # Detect device
-    if _torch.backends.mps.is_available():
-        _device = "mps"
-        _compute_type = "float16"
-
-    # Try MLX
-    try:
-        import mlx_whisper
-        _mlx_whisper = mlx_whisper
-        _use_mlx = True
-        print("MLX backend available — using Apple Silicon GPU for ASR")
-    except ImportError:
-        print("MLX not available — using faster-whisper/CPU backend")
-
-    # Import diarization pipeline
-    from whisperx.diarize import DiarizationPipeline
-    _DiarizationPipeline = DiarizationPipeline
-
-    _ml_deps_ready = True
-
-
-def _get_model():
-    """Lazy-load the Whisper model (faster-whisper/CPU path only)."""
-    global _model
-    if _model is None:
-        print("Loading Whisper large-v3-turbo model (CPU)...")
-        _model = _whisperx.load_model(
-            "large-v3-turbo",
-            device=_device if _device != "mps" else "cpu",
-            compute_type=_compute_type if _device != "mps" else "int8",
-            language=None,
-        )
-        print("Model loaded.")
-    return _model
-
-
-def _transcribe_mlx(
-    audio_path: str, language: str | None = None, model_repo: str | None = None,
-) -> dict:
-    """Transcribe using MLX backend (Apple Silicon GPU)."""
-    repo = model_repo or _mlx_model
-    print(f"Transcribing with MLX ({repo})...")
-    result = _mlx_whisper.transcribe(
-        audio_path,
-        path_or_hf_repo=repo,
-        language=language,
-        word_timestamps=True,
-    )
-    segments = []
-    for seg in result.get("segments", []):
-        segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"],
-            "words": seg.get("words", []),
-        })
-    detected_lang = result.get("language", language or "unknown")
-    print(f"MLX transcription complete. Language: {detected_lang}")
-    return {"segments": segments, "language": detected_lang}
-
-
-def _get_diarize_pipeline():
-    """Lazy-load the pyannote diarization pipeline."""
-    global _diarize_pipeline
-    if _diarize_pipeline is None:
-        print("Loading pyannote diarization pipeline...")
-        old_cache = os.environ.get("HF_HUB_CACHE")
-        old_offline = os.environ.get("HF_HUB_OFFLINE")
-        try:
-            if _MODELS_DIR.is_dir():
-                os.environ["HF_HUB_CACHE"] = str(_MODELS_DIR)
-                os.environ["HF_HUB_OFFLINE"] = "1"
-            _diarize_pipeline = _DiarizationPipeline(
-                model_name="pyannote/speaker-diarization-3.1",
-                device="cpu",
-            )
-        finally:
-            if old_cache is None:
-                os.environ.pop("HF_HUB_CACHE", None)
-            else:
-                os.environ["HF_HUB_CACHE"] = old_cache
-            if old_offline is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = old_offline
-        print("Diarization pipeline loaded.")
-    return _diarize_pipeline
-
-
-def _format_transcript(result: dict, include_timestamps: bool = True) -> str:
-    """Format a WhisperX result into readable text."""
-    lines = []
-    for seg in result.get("segments", []):
-        speaker = seg.get("speaker", "Unknown")
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        if include_timestamps:
-            start = seg.get("start", 0)
-            end = seg.get("end", 0)
-            ts = f"[{_fmt_time(start)} - {_fmt_time(end)}]"
-            lines.append(f"{ts} {speaker}: {text}")
-        else:
-            lines.append(f"{speaker}: {text}")
-    return "\n\n".join(lines)
-
-
-def _fmt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _find_audio_files(directory: str) -> list[Path]:
-    audio_extensions = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".wma", ".aac", ".mp4"}
-    path = Path(directory)
-    if not path.is_dir():
-        return []
-    return [f for f in sorted(path.iterdir()) if f.suffix.lower() in audio_extensions and f.is_file()]
-
-
 @mcp.tool()
 def list_audios(directory: str) -> str:
     """List audio files in a directory with their duration estimates.
@@ -213,7 +41,7 @@ def list_audios(directory: str) -> str:
     Args:
         directory: Path to directory containing audio files.
     """
-    files = _find_audio_files(directory)
+    files = find_audio_files(directory)
     if not files:
         return f"No audio files found in {directory}"
 
@@ -255,106 +83,46 @@ def transcribe_audio(
     if not path.exists():
         return f"File not found: {file_path}"
 
-    # Ensure ML dependencies are installed (instant after first run)
-    _ensure_ml_deps()
-
-    file_key = str(path.resolve())
-    start_time = time.time()
-    mlx_model = model or _mlx_model
-
-    # Step 1: Load audio
-    print(f"Loading audio: {path.name}")
-    audio = _whisperx.load_audio(str(path))
-    duration_s = len(audio) / 16000
-    print(f"Audio loaded: {duration_s:.0f}s ({duration_s/60:.1f} min)")
-
-    # Step 2: Transcribe (MLX GPU or faster-whisper CPU)
-    if _use_mlx:
-        result = _transcribe_mlx(str(path), language=language, model_repo=mlx_model)
-        detected_lang = result["language"]
-    else:
-        print("Transcribing (CPU)...")
-        whisper_model = _get_model()
-        result = whisper_model.transcribe(
-            audio,
-            batch_size=16 if _device != "mps" else 4,
+    try:
+        result = transcribe(
+            file_path=file_path,
             language=language,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            skip_diarization=skip_diarization,
+            model=model,
         )
-        detected_lang = result.get("language", language or "unknown")
-        print(f"Transcription complete. Language: {detected_lang}")
+    except FileNotFoundError as e:
+        return str(e)
 
-    # Step 3: Diarization (optional, parallel with alignment)
-    if not skip_diarization:
-        def _align():
-            print("Aligning timestamps...")
-            align_model, align_metadata = _whisperx.load_align_model(
-                language_code=detected_lang,
-                device="cpu",
-            )
-            aligned = _whisperx.align(
-                result["segments"],
-                align_model,
-                align_metadata,
-                audio,
-                device="cpu",
-                return_char_alignments=False,
-            )
-            print("Alignment complete.")
-            return aligned
-
-        def _diarize():
-            print("Running speaker diarization...")
-            diarize_pipeline = _get_diarize_pipeline()
-            diarize_kwargs = {}
-            if num_speakers is not None:
-                diarize_kwargs["num_speakers"] = num_speakers
-            if min_speakers is not None:
-                diarize_kwargs["min_speakers"] = min_speakers
-            if max_speakers is not None:
-                diarize_kwargs["max_speakers"] = max_speakers
-            diarize_result = diarize_pipeline(str(path), **diarize_kwargs)
-            print("Diarization complete.")
-            return diarize_result
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            align_future = executor.submit(_align)
-            diarize_future = executor.submit(_diarize)
-            aligned_result = align_future.result()
-            diarize_segments = diarize_future.result()
-
-        result = _whisperx.assign_word_speakers(diarize_segments, aligned_result)
-
-    elapsed = time.time() - start_time
-
+    file_key = result["path"]
     _transcriptions[file_key] = {
-        "file": path.name,
+        "file": result["file"],
         "path": file_key,
-        "language": detected_lang,
-        "duration_s": duration_s,
-        "processing_time_s": elapsed,
+        "language": result["language"],
+        "duration_s": result["duration_s"],
+        "processing_time_s": result["processing_time_s"],
         "segments": result["segments"],
         "speaker_names": {},
     }
 
-    speakers = set()
-    for seg in result["segments"]:
-        if "speaker" in seg:
-            speakers.add(seg["speaker"])
-
-    transcript_text = _format_transcript(result)
-    backend = f"MLX ({mlx_model.split('/')[-1]})" if _use_mlx else "CPU"
+    speakers = result["speakers"]
     diarization_status = "skipped" if skip_diarization else f"{len(speakers)} speakers"
 
     summary = (
-        f"Transcription complete: {path.name}\n"
-        f"Duration: {duration_s/60:.1f} min | "
-        f"Processing time: {elapsed:.0f}s ({duration_s/elapsed:.1f}x real-time) | "
-        f"Backend: {backend}\n"
-        f"Language: {detected_lang} | "
+        f"Transcription complete: {result['file']}\n"
+        f"Duration: {result['duration_s']/60:.1f} min | "
+        f"Processing time: {result['processing_time_s']:.0f}s "
+        f"({result['duration_s']/result['processing_time_s']:.1f}x real-time) | "
+        f"Backend: {result['backend']}\n"
+        f"Language: {result['language']} | "
         f"Diarization: {diarization_status}"
     )
     if speakers:
-        summary += f" ({', '.join(sorted(speakers))})"
+        summary += f" ({', '.join(speakers)})"
+
+    transcript_text = format_transcript({"segments": result["segments"]})
     summary += (
         f"\nSegments: {len(result['segments'])}\n\n"
         f"--- Transcript ---\n\n{transcript_text}"
@@ -408,7 +176,7 @@ def get_transcription(
         return f"No transcription found for {file_path}. Use transcribe_audio first."
 
     t = _transcriptions[key]
-    result = {"segments": t["segments"]}
+    result = {"segments": list(t["segments"])}
     names = t.get("speaker_names", {})
 
     for seg in result["segments"]:
@@ -422,7 +190,7 @@ def get_transcription(
             if s.get("speaker", "") == speaker_filter
         ]
 
-    return _format_transcript(result, include_timestamps=include_timestamps)
+    return format_transcript(result, include_timestamps=include_timestamps)
 
 
 @mcp.tool()
@@ -480,38 +248,10 @@ def export_transcription(
             "segments": t["segments"],
         }
         out.write_text(json.dumps(export_data, indent=2, ensure_ascii=False))
-
-    elif format == "srt":
-        lines = []
-        for i, seg in enumerate(t["segments"], 1):
-            start = seg.get("start", 0)
-            end = seg.get("end", 0)
-            speaker = seg.get("speaker", "Unknown")
-            speaker = names.get(speaker, speaker)
-            text = seg.get("text", "").strip()
-            lines.append(str(i))
-            lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
-            lines.append(f"[{speaker}] {text}")
-            lines.append("")
-        out.write_text("\n".join(lines))
-
-    else:  # txt
-        segments = t["segments"]
-        for seg in segments:
-            sid = seg.get("speaker", "Unknown")
-            if sid in names:
-                seg["speaker"] = names[sid]
-        out.write_text(_format_transcript({"segments": segments}))
+    else:
+        out.write_text(export_transcript(t["segments"], format=format, speaker_names=names))
 
     return f"Exported to {out}"
-
-
-def _srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def main():
