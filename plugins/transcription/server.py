@@ -5,6 +5,8 @@ Requires scribe to be installed: brew install theam/tap/scribe
 """
 
 import json
+import shutil
+import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -17,8 +19,31 @@ from transcription import (
     transcribe,
 )
 
+# Check for scribe CLI at startup
+_scribe_available = shutil.which("scribe") is not None
+if not _scribe_available:
+    # Check common Homebrew locations too
+    for p in ["/opt/homebrew/bin/scribe", "/usr/local/bin/scribe"]:
+        if Path(p).is_file():
+            _scribe_available = True
+            break
+
+if not _scribe_available:
+    print(
+        "WARNING: scribe CLI not found. Transcription will not work.\n"
+        "Install it with: brew install theam/tap/scribe\n"
+        "More info: https://github.com/theam/scribe",
+        file=sys.stderr,
+    )
+
 # In-memory transcription store (session-scoped)
 _transcriptions: dict[str, dict] = {}
+
+_scribe_install_msg = (
+    "The scribe CLI is required but not installed.\n"
+    "Install it with: brew install theam/tap/scribe\n"
+    "More info: https://github.com/theam/scribe"
+)
 
 mcp = FastMCP(
     "transcription",
@@ -28,7 +53,8 @@ mcp = FastMCP(
         "Use list_audios to see available audio files. "
         "Use list_transcriptions to see completed transcriptions. "
         "Use get_transcription to view a specific transcription. "
-        "Use set_speaker_name to assign names to identified speakers."
+        "Use set_speaker_name to assign names to identified speakers. "
+        "Requires the scribe CLI: brew install theam/tap/scribe"
     ),
 )
 
@@ -77,6 +103,9 @@ def transcribe_audio(
         skip_diarization: Skip speaker identification for faster processing.
         model: Whisper model override (e.g., 'large-v3' for best accuracy).
     """
+    if not _scribe_available:
+        return _scribe_install_msg
+
     path = Path(file_path)
     if not path.exists():
         return f"File not found: {file_path}"
