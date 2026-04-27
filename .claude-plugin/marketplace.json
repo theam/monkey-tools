@@ -15,8 +15,8 @@
       "author": {
         "name": "The Agile Monkeys"
       },
-      "homepage": "https://github.com/theam/monkey-tools",
-      "repository": "https://github.com/theam/monkey-tools",
+      "homepage": "https://github.com/theam/claude-open-marketplace",
+      "repository": "https://github.com/theam/claude-open-marketplace",
       "license": "Apache-2.0",
       "keywords": ["transcription", "audio", "diarization", "whisper", "mlx", "apple-silicon"],
       "category": "productivity"
